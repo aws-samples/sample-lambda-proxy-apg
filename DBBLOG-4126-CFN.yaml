@@ -1,0 +1,795 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  WinAdminPassword:
+    Type: String
+    NoEcho: true  
+    Description: "Password for Windows Administrator account. Must be 8-32 characters containing letters, numbers, and symbols."
+    MinLength: 8
+    MaxLength: 32
+    AllowedPattern: ^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,32}$
+    ConstraintDescription: |
+      Password must:
+      - Be 8-32 characters long
+      - Include at least one uppercase letter
+      - Include at least one lowercase letter
+      - Include at least one number
+      - Include at least one special character (@$!%*?&)
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base
+
+Resources:
+  BlogLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: 
+              - 'lambda:CreateFunction'
+              - 'lambda:InvokeFunction'
+              - 'lambda:DeleteFunction'
+              - 'lambda:GetFunctionConfiguration'
+              - 'lambda:UpdateFunctionConfiguration'
+              - 'lambda:UpdateFunctionCode'
+            Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:demo-*'
+          - Effect: Allow
+            Action:
+              - 'iam:PassRole'
+            Resource: 
+              - !GetAtt BlogLambdaRole.Arn
+
+  BlogLogPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_POLICYDOCUMENT_NO_WILDCARD_RESOURCE
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'logs:GetLogEvents'
+              - 'logs:DescribeLogStreams'
+            Resource:
+            - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/demo-*'
+          - Effect: Allow
+            Action:
+              - 'logs:DescribeLogGroups'
+            Resource: '*'
+
+  BlogEC2Policy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_POLICYDOCUMENT_NO_WILDCARD_RESOURCE
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ec2:DescribeVpcs'
+              - 'ec2:DescribeSubnets'
+              - 'ec2:DescribeSecurityGroups'
+            Resource: '*'
+
+  BlogIAMPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_POLICYDOCUMENT_NO_WILDCARD_RESOURCE
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'iam:CreateRole'
+            Resource:
+              - !Sub 'arn:aws:iam::${AWS::AccountId}:role/*BlogLambdaRole*'
+          - Effect: Allow
+            Action:
+              - 'iam:ListRoles'
+            Resource: '*'
+
+  BlogSecretsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'secretsmanager:GetSecretValue'
+              - 'secretsmanager:DescribeSecret'
+            Resource:
+              - !Ref BlogRDSProxySecret
+          - Effect: Allow
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource:
+              - !GetAtt BlogKMSKey.Arn
+
+  # IAM User and Access Key
+  BlogIAMUser:
+    Type: AWS::IAM::User
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_USER_LOGIN_PROFILE_PASSWORD_RESET_RULE
+          - IAM_USER_LOGIN_PROFILE_USES_SECURE_PARAMETER
+          - IAM_USER_MISSING_GROUP_RULE
+          - IAM_USER_LOGIN_PROFILE_EXISTS
+          - IAM_USER_HAS_LOGIN_PROFILE
+          - IAM_USER_PASSWORD_POLICY
+          - IAM_USER_LOGIN_PROFILE_PASSWORD_EXISTS
+    Properties:
+      UserName: blog-user
+      ManagedPolicyArns:
+        - !Ref BlogLambdaPolicy
+        - !Ref BlogLogPolicy
+        - !Ref BlogEC2Policy
+        - !Ref BlogIAMPolicy
+        - !Ref BlogSecretsPolicy
+
+  BlogIAMUserAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref BlogIAMUser
+
+  # VPC
+  BlogVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: blog-vpc
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref BlogVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnet
+  BlogPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref BlogVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: blog-pub-sub
+
+  # Private Subnet1
+  BlogPrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref BlogVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: blog-priv-sub1
+
+  # Private Subnet2
+  BlogPrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref BlogVPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: blog-priv-sub2
+
+  # Private Subnet3
+  BlogPrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref BlogVPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: blog-priv-sub3
+
+  BlogDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: blog-db-sub
+      DBSubnetGroupDescription: Subnet group for Aurora PostgreSQL
+      SubnetIds: 
+        - !Ref BlogPrivateSubnet1
+        - !Ref BlogPrivateSubnet2
+        - !Ref BlogPrivateSubnet3
+
+  # EIP for NAT Gateway
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  # NAT Gateway
+  BlogNatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref BlogPublicSubnet
+      Tags:
+        - Key: Name
+          Value: blog-pub-nat-gw
+
+  # Route Tables
+  BlogPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BlogVPC
+      Tags:
+        - Key: Name
+          Value: blog-rt-pub
+
+  BlogPrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BlogVPC
+      Tags:
+        - Key: Name
+          Value: blog-rt-priv
+
+  # Routes
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Metadata:
+      guard:
+        SuppressedRules:
+          - NO_UNRESTRICTED_ROUTE_TO_IGW
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref BlogPublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref BlogPrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref BlogNatGateway
+
+  # Subnet Route Table Associations
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref BlogPublicSubnet
+      RouteTableId: !Ref BlogPublicRouteTable
+
+  PrivateSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref BlogPrivateSubnet1
+      RouteTableId: !Ref BlogPrivateRouteTable
+
+  PrivateSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref BlogPrivateSubnet2
+      RouteTableId: !Ref BlogPrivateRouteTable
+
+  PrivateSubnetRouteTableAssociation3:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref BlogPrivateSubnet3
+      RouteTableId: !Ref BlogPrivateRouteTable
+
+  # Security Groups
+  BlogLambdaSG:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          - SECURITY_GROUP_MISSING_EGRESS_RULE
+    Properties:
+      GroupDescription: Security group for Lambda
+      VpcId: !Ref BlogVPC
+      Tags:
+        - Key: Name
+          Value: blog-lambda-sg
+      
+  BlogRDSProxySG:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          - SECURITY_GROUP_MISSING_EGRESS_RULE
+    Properties:
+      GroupDescription: Security group for RDS Proxy
+      VpcId: !Ref BlogVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BlogEC2SG
+          Description: "Allow Postgres traffic from EC2"
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BlogLambdaSG
+          Description: "Allow Postgres traffic from Lambda"
+      Tags:
+        - Key: Name
+          Value: blog-rds-proxy-sg
+
+  BlogRDSSG:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          - SECURITY_GROUP_MISSING_EGRESS_RULE
+    Properties:
+      GroupDescription: Security group for RDS
+      VpcId: !Ref BlogVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BlogEC2SG
+          Description: "Allow Postgres traffic from EC2"
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BlogRDSProxySG
+          Description: "Allow Postgres traffic from RDS Proxy"
+      Tags:
+        - Key: Name
+          Value: blog-rds-sg
+
+  BlogEC2SG:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          - SECURITY_GROUP_MISSING_EGRESS_RULE
+    Properties:
+      GroupDescription: Security group for EC2
+      VpcId: !Ref BlogVPC
+      Tags:
+        - Key: Name
+          Value: blog-ec2-sg
+
+  BlogEndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for VPC Endpoints
+      VpcId: !Ref BlogVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref BlogEC2SG
+          Description: "Allow https traffic from EC2"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref BlogLambdaSG
+          Description: "Allow https traffic from Lambda"
+      SecurityGroupEgress: 
+        - IpProtocol: tcp 
+          FromPort: 443 
+          ToPort: 443 
+          DestinationSecurityGroupId: !Ref BlogEC2SG
+          Description: "Allow HTTPS outbound in VPC"
+      Tags:
+        - Key: Name
+          Value: blog-ep-sg
+
+  # customize DB secret
+  BlogDBSecret:
+    Type: AWS::SecretsManager::Secret
+    Metadata:
+      guard:
+        SuppressedRules:
+          - SECRETSMANAGER_ROTATION_ENABLED_CHECK
+    Properties:
+      Name: 'blog-apg-secret'
+      Description: 'Secret for Aurora PostgreSQL'
+      KmsKeyId: !Ref BlogKMSKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "postgres", "dbname": "postgres", "port": "5432"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+        ExcludePunctuation: true
+
+  # Aurora PostgreSQL Cluster
+  BlogDBCluster:
+    Type: AWS::RDS::DBCluster
+    Metadata:
+      guard:
+        SuppressedRules:
+          - RDS_CLUSTER_MASTER_USER_PASSWORD_NO_PLAINTEXT_PASSWORD
+          - RDS_CLUSTER_MASTER_USER_PASSWORD_USES_SECURE_PARAMETER
+          - RDS_CLUSTER_MASTER_USER_PASSWORD_USES_SECURE_SERVICE
+          - RDS_MASTER_USER_NAME_USES_SECURE_PARAMETER
+    DeletionPolicy: Delete  # Ensures the DB cluster is completely deleted
+    Properties:
+      Engine: aurora-postgresql
+      EngineMode: provisioned
+      EngineVersion: 16.8  # Replace with desired Aurora PostgreSQL version
+      EnableIAMDatabaseAuthentication: true
+      EnableCloudwatchLogsExports:
+        - postgresql
+      KmsKeyId: !Ref BlogKMSKey
+      StorageEncrypted: true
+      MasterUsername: !Sub '{{resolve:secretsmanager:${BlogDBSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${BlogDBSecret}:SecretString:password}}'
+      DatabaseName: !Sub '{{resolve:secretsmanager:${BlogDBSecret}:SecretString:dbname}}'
+      Port: !Sub '{{resolve:secretsmanager:${BlogDBSecret}:SecretString:port}}'
+      VpcSecurityGroupIds: 
+        - !Ref BlogRDSSG
+      DBSubnetGroupName: !Ref BlogDBSubnetGroup
+      BackupRetentionPeriod: 1  
+
+
+  # Aurora PostgreSQL Instance
+  BlogDBInstance:
+    Type: AWS::RDS::DBInstance
+    Metadata:
+      guard:
+        SuppressedRules:
+          - DB_INSTANCE_BACKUP_ENABLED
+          - RDS_MULTI_AZ_SUPPORT
+          - RDS_INSTANCE_DELETION_PROTECTION_ENABLED
+          - RDS_INSTANCE_CLOUDWATCH_LOGS_ENABLED
+          - RDS_INSTANCE_MASTER_USERNAME_SECURE
+          - RDS_INSTANCE_MASTER_PASSWORD_SECURE
+          - RDS_INSTANCE_STORAGE_ENCRYPTED
+          - RDS_INSTANCE_LOGGING_ENABLED
+    Properties:
+      DBInstanceClass: "db.t3.medium"
+      Engine: "aurora-postgresql"
+      DBClusterIdentifier: !Ref BlogDBCluster
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref BlogDBSubnetGroup
+      StorageEncrypted: true
+      EnablePerformanceInsights: true
+      MonitoringInterval: 60
+      AutoMinorVersionUpgrade: true
+      MonitoringRoleArn: !GetAtt RDSEnhancedMonitoringRole.Arn
+
+  RDSEnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole 
+
+  # RDS Proxy Role
+  BlogRDSProxySecretAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource: 
+              - !Ref BlogDBSecret
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource:
+              - !GetAtt BlogKMSKey.Arn
+
+  BlogRDSProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com  # Allows RDS Proxy to assume this role
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+       - !Ref BlogRDSProxySecretAccessPolicy
+
+  # RDS Proxy
+  BlogRDSProxy:
+    Type: AWS::RDS::DBProxy
+    Properties:
+      DBProxyName: 'blog-rds-proxy'
+      EngineFamily: 'POSTGRESQL'
+      RoleArn: !GetAtt BlogRDSProxyRole.Arn
+      Auth:
+        - AuthScheme: 'SECRETS'
+          IAMAuth: 'DISABLED'
+          SecretArn: !Ref BlogDBSecret
+      VpcSecurityGroupIds: 
+        - !Ref BlogRDSProxySG
+      VpcSubnetIds: 
+        - !Ref BlogPrivateSubnet1
+        - !Ref BlogPrivateSubnet2
+        - !Ref BlogPrivateSubnet3
+      RequireTLS: true
+      DebugLogging: false
+      IdleClientTimeout: 1800
+
+  BlogProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      DBProxyName: !Ref BlogRDSProxy
+      TargetGroupName: default    # This is required and must be 'default'
+      ConnectionPoolConfigurationInfo:
+        MaxConnectionsPercent: 100
+        MaxIdleConnectionsPercent: 50
+        ConnectionBorrowTimeout: 120
+      DBClusterIdentifiers: 
+        - !Ref BlogDBCluster  # Reference to your Aurora PostgreSQL Cluster
+    DependsOn: 
+        - BlogRDSProxy
+        - BlogDBInstance
+
+  BlogKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "Customer managed key with rotation"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+  # Create DB proxy secret
+  BlogRDSProxySecret:
+    Type: AWS::SecretsManager::Secret
+    Metadata:
+      guard:
+        SuppressedRules:
+          - SECRETSMANAGER_ROTATION_ENABLED_CHECK
+    Properties:
+      Name: 'blog-rds-proxy-secret'
+      Description: 'Secret for RDS Proxy'
+      KmsKeyId: !Ref BlogKMSKey
+      SecretString: 
+        !Sub |
+          {
+            "host": "${BlogRDSProxy.Endpoint}",
+            "port": "{{resolve:secretsmanager:${BlogDBSecret}:SecretString:port}}",
+            "dbname": "{{resolve:secretsmanager:${BlogDBSecret}:SecretString:dbname}}",
+            "username": "{{resolve:secretsmanager:${BlogDBSecret}:SecretString:username}}",
+            "password": "{{resolve:secretsmanager:${BlogDBSecret}:SecretString:password}}"
+          }
+    DependsOn: 
+      - BlogDBSecret
+      - BlogRDSProxy
+
+  # Lambda Role
+  BlogLambdaSecretAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource: 
+              - !Ref BlogRDSProxySecret
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource:
+              - !GetAtt BlogKMSKey.Arn
+
+  BlogLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com  
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - !Ref BlogLambdaSecretAccessPolicy
+
+  # VPC Endpoints
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BlogVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcEndpointType: Interface
+      SubnetIds: 
+        - !Ref BlogPrivateSubnet1
+      SecurityGroupIds:
+        - !Ref BlogEndpointSG
+
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BlogVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      PrivateDnsEnabled: true
+      VpcEndpointType: Interface
+      SubnetIds: 
+        - !Ref BlogPrivateSubnet1
+      SecurityGroupIds:
+        - !Ref BlogEndpointSG
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BlogVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      PrivateDnsEnabled: true
+      VpcEndpointType: Interface
+      SubnetIds: 
+        - !Ref BlogPrivateSubnet1
+      SecurityGroupIds:
+        - !Ref BlogEndpointSG
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BlogVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      PrivateDnsEnabled: true
+      VpcEndpointType: Interface
+      SubnetIds: 
+        - !Ref BlogPrivateSubnet1
+      SecurityGroupIds:
+        - !Ref BlogEndpointSG
+
+  EC2Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref BlogVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2
+      VpcEndpointType: Interface
+      SubnetIds: 
+        - !Ref BlogPrivateSubnet1
+      SecurityGroupIds:
+        - !Ref BlogEndpointSG
+
+  # IAM Role
+  BlogEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - !Ref BlogSecretsPolicy
+
+  # IAM Instance Profile
+  BlogEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: blog-ec2-role
+      Roles:
+        - !Ref BlogEC2Role
+
+  # Key Pair
+  BlogKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: blog-kp
+
+  # Windows EC2 Instance
+  BlogWindowsEC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.medium
+      SubnetId: !Ref BlogPrivateSubnet1
+      SecurityGroupIds:
+        - !Ref BlogEC2SG
+      Monitoring: true
+      IamInstanceProfile: !Ref BlogEC2InstanceProfile
+      EbsOptimized: true
+      KeyName: !Ref BlogKeyPair
+      Tags:
+        - Key: Name
+          Value: blog-win-ec2
+      UserData:
+        Fn::Base64: !Sub 
+        - |          
+          <powershell>
+          Write-Output "Starting User Data script..." >> C:\aws-setup.log
+
+          Write-Output "Resetting Administrator password" >> C:\aws-setup.log
+          net user Administrator ${WinAdminPassword}
+          Write-Output "Resetting Administrator password completed" >> C:\aws-setup.log
+
+          # Download pgAdmin installer
+          $url = "https://ftp.postgresql.org/pub/pgadmin/pgadmin4/v9.9/windows/pgadmin4-9.9-x64.exe"
+          $output = "C:\pgadmin4-installer.exe"
+          "[$(Get-Date)] Downloading pgAdmin ..." | Out-File -FilePath C:\aws-setup.log -Append
+          Invoke-WebRequest -Uri $url -OutFile $output
+
+          # Install pgAdmin silently
+          "[$(Get-Date)] Installing pgAdmin ..." | Out-File -FilePath C:\aws-setup.log -Append
+          Start-Process -FilePath $output -ArgumentList "/VERYSILENT /NORESTART /ALLUSERS" -Wait
+
+          # Install AWS CLI
+          "[$(Get-Date)] Installing AWS CLI" | Out-File -FilePath C:\aws-setup.log -Append
+          msiexec.exe /i https://awscli.amazonaws.com/AWSCLIV2.msi /qn
+
+          # Waiting for installation to be completed
+          Start-Sleep -Seconds 120
+          "[$(Get-Date)] AWS CLI installation completed" | Out-File -FilePath C:\aws-setup.log -Append
+
+          # Check AWS CLI version and log the output
+          "[$(Get-Date)] Checking AWS CLI version ..." | Out-File -FilePath C:\aws-setup.log -Append
+          $Env:Path += ";C:\Program Files\Amazon\AWSCLIV2\"
+          aws  --version | Out-File -FilePath C:\aws-setup.log -Append
+
+          Write-Output "Configuring AWS CLI ..." >> C:\aws-setup.log  
+          Write-Output ${AccessKey} >> C:\aws-setup.log
+          Write-Output ${SecretKey} >> C:\aws-setup.log
+          Write-Output ${AWS::Region} >> C:\aws-setup.log
+
+          aws configure set aws_access_key_id ${AccessKey} | Out-File -FilePath C:\aws-setup.log -Append
+          aws configure set aws_secret_access_key ${SecretKey} | Out-File -FilePath C:\aws-setup.log -Append
+          aws configure set region ${AWS::Region} | Out-File -FilePath C:\aws-setup.log -Append
+          aws configure list | Out-File -FilePath C:\aws-setup.log -Append
+
+          # Install .NET SDK
+          Write-Output "Installing .NET SDK" | Out-File -FilePath C:\aws-setup.log -Append
+          Invoke-WebRequest -Uri https://dot.net/v1/dotnet-install.ps1 -OutFile dotnet-install.ps1
+          .\dotnet-install.ps1
+          [System.Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\Users\Administrator\AppData\Local\Microsoft\dotnet\", [System.EnvironmentVariableTarget]::Machine)
+          [System.Environment]::SetEnvironmentVariable("DOTNET_ROOT", "C:\Users\Administrator\AppData\Local\Microsoft\dotnet\", "Machine")
+          dotnet --list-sdks >> C:\aws-setup.log 
+          dotnet --version >> C:\aws-setup.log
+          dotnet new install Amazon.Lambda.Templates >> C:\aws-setup.log
+          dotnet tool install -g Amazon.Lambda.Tools >> C:\aws-setup.log
+          Write-Output ".NET SDK installation completed" | Out-File -FilePath C:\aws-setup.log -Append
+
+          "[$(Get-Date)] User Data script execution completed" | Out-File -FilePath C:\aws-setup.log -Append
+          </powershell>
+
+        - AccessKey: !Ref BlogIAMUserAccessKey
+          SecretKey: !GetAtt BlogIAMUserAccessKey.SecretAccessKey
+
+Outputs:
+  WinAdminPassword:
+    Description: "The Administrator password for Windows EC2."
+    Value: !Ref WinAdminPassword
+
