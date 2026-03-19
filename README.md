@@ -1,4 +1,4 @@
-# Connecting .NET Lambda to Aurora PostgreSQL via RDS Proxy
+# Connecting .NET Lambda to Amazon Aurora PostgreSQL via RDS Proxy
 
 Demo environment for the AWS Database Blog post: **Connecting .NET Lambda to Aurora PostgreSQL via RDS Proxy**
 
