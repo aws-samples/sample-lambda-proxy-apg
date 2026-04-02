@@ -738,7 +738,7 @@ Resources:
           Write-Output "Resetting Administrator password completed" >> C:\aws-setup.log
 
           # Download pgAdmin installer
-          $url = "https://ftp.postgresql.org/pub/pgadmin/pgadmin4/v9.9/windows/pgadmin4-9.9-x64.exe"
+          $url = "https://ftp.postgresql.org/pub/pgadmin/pgadmin4/v9.14/windows/pgadmin4-9.14-x64.exe"
           $output = "C:\pgadmin4-installer.exe"
           "[$(Get-Date)] Downloading pgAdmin ..." | Out-File -FilePath C:\aws-setup.log -Append
           Invoke-WebRequest -Uri $url -OutFile $output
